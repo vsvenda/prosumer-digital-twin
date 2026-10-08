@@ -5,16 +5,23 @@ Source:
     CAMS Solar Radiation Time-Series (1-minute resolution)
 
 Outputs:
-    data/raw/cams/                       Original monthly CAMS files
-    data/processed/cams_*_1min.csv       Clean 1-minute dataset
+    data/raw/historical/<location_start_end>/cams/
+        Original monthly CAMS files and request metadata.
+
+    data/processed/historical/<location_start_end>/cams/
+        Clean combined 1-minute CAMS dataset.
 
 The processed dataset contains GHI, DHI and BNI irradiation in Wh/m²,
 together with the CAMS reliability indicator. All timestamps use UTC.
 
-Temporal aggregation is handled separately by build_10min_datasets.py.
+Temporal aggregation is handled separately by build_10min_historical_datasets.py.
 """
 
 from pathlib import Path
+import argparse
+import hashlib
+import json
+import pipeline_config as cfg
 
 import cdsapi
 import pandas as pd
@@ -24,20 +31,19 @@ import pandas as pd
 # Configuration
 # ============================================================
 
-LATITUDE = 45.7742  # Sombor, Serbia
-LONGITUDE = 19.1122
+LATITUDE = cfg.LATITUDE
+LONGITUDE = cfg.LONGITUDE
 
-START_DATE = pd.Timestamp("2023-04-07")
-END_DATE = pd.Timestamp("2026-03-31")
+START_DATE = pd.Timestamp(cfg.START_DATE)
+END_DATE = pd.Timestamp(cfg.END_DATE)
 
 DATASET = "cams-solar-radiation-timeseries"
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
-RAW_CAMS_DIR = PROJECT_ROOT / "data" / "raw" / "cams"
-PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
-
-OUTPUT_FILE = PROCESSED_DIR / "cams_sombor_1min.csv"
+RAW_CAMS_DIR = None
+PROCESSED_DIR = None
+OUTPUT_FILE = None
 
 
 CAMS_COLUMNS = [
@@ -111,69 +117,32 @@ def get_monthly_periods():
     return periods
 
 
-def download_month(
-    client,
-    start_date,
-    end_date,
-):
-    """
-    Download one CAMS monthly chunk.
-    """
-
-    filename = (
-        f"cams_"
-        f"{start_date.strftime('%Y-%m-%d')}_"
-        f"{end_date.strftime('%Y-%m-%d')}.csv"
-    )
-
-    output_path = RAW_CAMS_DIR / filename
-
-    if (
-        output_path.exists()
-        and output_path.stat().st_size > 0
-    ):
-        print(
-            f"Already downloaded: {filename}"
-        )
-
-        return output_path
-
+def download_month(client, start_date, end_date):
+    """Download a request-hashed chunk; reuse known original-site legacy files."""
     request = {
-        "sky_type": "observed_cloud",
-        "location": {
-            "longitude": LONGITUDE,
-            "latitude": LATITUDE,
-        },
-        "altitude": ["-999"],
-        "date": [
-            (
-                f"{start_date.strftime('%Y-%m-%d')}/"
-                f"{end_date.strftime('%Y-%m-%d')}"
-            )
-        ],
-        "time_step": "1minute",
-        "time_reference": "universal_time",
-        "data_format": "csv",
+        'sky_type': 'observed_cloud',
+        'location': {'longitude': LONGITUDE, 'latitude': LATITUDE},
+        'altitude': ['-999'],
+        'date': [f'{start_date:%Y-%m-%d}/{end_date:%Y-%m-%d}'],
+        'time_step': '1minute', 'time_reference': 'universal_time', 'data_format': 'csv',
     }
-
-    print()
-    print(
-        f"Downloading "
-        f"{start_date.date()} -> "
-        f"{end_date.date()}"
-    )
-
-    client.retrieve(
-        DATASET,
-        request,
-    ).download(
-        str(output_path)
-    )
-
-    print(
-        f"Saved: {output_path}"
-    )
-
+    stem = f'cams_{start_date:%Y-%m-%d}_{end_date:%Y-%m-%d}'
+    signature = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()[:12]
+    output_path = RAW_CAMS_DIR / f'{stem}_{signature}.csv'
+    legacy = RAW_CAMS_DIR / f'{stem}.csv'
+    if output_path.exists() and output_path.stat().st_size > 0:
+        print(f'Already downloaded: {output_path.name}')
+        return output_path
+    # Original repository requests used precisely this site and all other parameters above.
+    # A changed site must never reuse these unlabelled legacy chunks.
+    if LATITUDE == 45.7742 and LONGITUDE == 19.1122 and legacy.exists() and legacy.stat().st_size > 0:
+        print(f'Reusing original-site legacy chunk: {legacy.name}')
+        return legacy
+    print(f'Downloading CAMS: {start_date.date()} -> {end_date.date()}', flush=True)
+    temporary = output_path.with_suffix('.csv.part')
+    client.retrieve(DATASET, request).download(str(temporary))
+    temporary.replace(output_path)
+    output_path.with_suffix('.request.json').write_text(json.dumps(request, indent=2), encoding='utf-8')
     return output_path
 
 
@@ -209,6 +178,10 @@ def parse_cams_file(file_path):
         utc=True,
     )
 
+    ends = pd.to_datetime(df['timestamp_end'], utc=True)
+    if not (ends - df['timestamp']).eq(pd.Timedelta(minutes=1)).all():
+        raise ValueError('Expected one-minute CAMS observation periods')
+
     df = df[
         [
             "timestamp",
@@ -239,6 +212,7 @@ def parse_cams_file(file_path):
             df[column],
             errors="coerce",
         )
+        df.loc[df[column] < 0, column] = float("nan")
 
     return df
 
@@ -344,6 +318,39 @@ def validate_dataset(df):
 # ============================================================
 
 def main():
+    global START_DATE, END_DATE, RAW_CAMS_DIR, PROCESSED_DIR, OUTPUT_FILE
+    parser = argparse.ArgumentParser(description="Download historical observed-cloud CAMS radiation.")
+    parser.add_argument('--start', default=cfg.START_DATE)
+    parser.add_argument('--end', default=cfg.END_DATE)
+    parser.add_argument('--data-dir', type=Path, default=cfg.DATA_DIR)
+    args = parser.parse_args()
+    START_DATE, END_DATE = pd.Timestamp(args.start), pd.Timestamp(args.end)
+
+    if START_DATE > END_DATE:
+        parser.error('--start must be before or equal to --end')
+
+    dataset_folder = f"{cfg.LOCATION}_{args.start}_{args.end}"
+
+    RAW_CAMS_DIR = (
+            args.data_dir
+            / 'raw'
+            / 'historical'
+            / dataset_folder
+            / 'cams'
+    )
+
+    PROCESSED_DIR = (
+            args.data_dir
+            / 'processed'
+            / 'historical'
+            / dataset_folder
+            / 'cams'
+    )
+
+    OUTPUT_FILE = (
+            PROCESSED_DIR
+            / f'cams_{cfg.LOCATION}_1min.csv'
+    )
 
     create_directories()
 

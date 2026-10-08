@@ -216,3 +216,26 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local measurements, raw responses and all processed datasets
+/data/*
+!/data/raw/
+!/data/processed/
+
+/data/raw/*
+!/data/raw/.gitkeep
+
+/data/processed/*
+!/data/processed/.gitkeep
+# Local credentials
+.cdsapirc
+.ecmwfapirc
+# IDE state
+.idea/
+.vscode/
+# Interrupted downloads
+*.part
+# Legacy CAMS smoke-test files created in the project root
+/cams_test_sombor.csv
+/cams_sombor_1min.csv
+/cams_sombor_10min.csv
