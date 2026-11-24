@@ -228,8 +228,11 @@ __marimo__/
 /data/processed/*
 !/data/processed/.gitkeep
 
-/results
+/results/*
+!/results/pvlib
 
+/results/pvlib/*
+!/results/pvlib/.gitkeep
 # Local credentials
 .cdsapirc
 .ecmwfapirc
