@@ -227,6 +227,9 @@ __marimo__/
 
 /data/processed/*
 !/data/processed/.gitkeep
+
+/results
+
 # Local credentials
 .cdsapirc
 .ecmwfapirc
